@@ -6,8 +6,8 @@
  * scoped client, checks the connection with `ping()`, maps ClickHouse errors
  * to `SqlError`, and aborts in-flight queries when interrupted. The
  * ClickHouse-specific service adds typed parameters, command execution, insert
- * queries, query id and settings helpers, a statement compiler, and direct or
- * config-backed layers.
+ * queries, format-aware streaming with progress events, query id and settings
+ * helpers, a statement compiler, and direct or config-backed layers.
  *
  * @since 4.0.0
  */
@@ -17,6 +17,7 @@ import * as Config from "effect/Config"
 import * as Context from "effect/Context"
 import * as Duration from "effect/Duration"
 import * as Effect from "effect/Effect"
+import * as Exit from "effect/Exit"
 import * as Fiber from "effect/Fiber"
 import { dual } from "effect/Function"
 import * as Layer from "effect/Layer"
@@ -83,6 +84,44 @@ const classifyError = (
   return fallback === "connection" ? new ConnectionError(props) : new UnknownError(props)
 }
 
+// Kept in sync with `SupportedRawFormats` from `@clickhouse/client` by the
+// `satisfies` check: adding or removing a raw format upstream fails to compile.
+const rawDataFormats = {
+  CSV: true,
+  CSVWithNames: true,
+  CSVWithNamesAndTypes: true,
+  TabSeparated: true,
+  TabSeparatedRaw: true,
+  TabSeparatedWithNames: true,
+  TabSeparatedWithNamesAndTypes: true,
+  CustomSeparated: true,
+  CustomSeparatedWithNames: true,
+  CustomSeparatedWithNamesAndTypes: true,
+  Parquet: true
+} satisfies Record<Clickhouse.RawDataFormat, true>
+
+// A type guard: `format in rawDataFormats` alone narrows the record, not `format`
+const isRawFormat = (format: Clickhouse.StreamableDataFormat): format is Clickhouse.RawDataFormat =>
+  format in rawDataFormats
+
+// In `JSONEachRowWithProgress` streams the server reports mid-stream failures
+// as a `{exception: string}` event instead of an HTTP error.
+const isExceptionEvent = (value: unknown): value is { exception: string } =>
+  typeof value === "object" && value !== null && "exception" in value &&
+  typeof (value as { exception: unknown }).exception === "string"
+
+const exceptionEventError = (event: { exception: string }) => {
+  // exception text starts with "Code: <n>. DB::Exception: ..."
+  const code = /^Code: (\d+)\./.exec(event.exception)
+  return new SqlError({
+    reason: classifyError(
+      code ? { code: Number(code[1]), message: event.exception } : event,
+      "Query failed while streaming",
+      "stream"
+    )
+  })
+}
+
 /**
  * Unique runtime identifier used to tag `ClickhouseClient` values.
  *
@@ -101,8 +140,9 @@ export type TypeId = "~@effect/sql-clickhouse/ClickhouseClient"
 
 /**
  * ClickHouse-specific `SqlClient` extension with access to its configuration,
- * typed parameter fragments, command-mode execution, insert queries, and
- * per-effect query ID and ClickHouse settings.
+ * typed parameter fragments, command-mode execution, insert queries,
+ * format-aware query streaming, and per-effect query ID and ClickHouse
+ * settings.
  *
  * @category services
  * @since 4.0.0
@@ -116,7 +156,13 @@ export interface ClickhouseClient extends Client.SqlClient {
     readonly table: string
     readonly values: Clickhouse.InsertValues<Readable, T>
     readonly format?: Clickhouse.DataFormat
+    readonly columns?: NonNullable<Clickhouse.InsertParams<Readable, T>["columns"]>
   }) => Effect.Effect<Clickhouse.InsertResult, SqlError>
+  readonly queryStream: <T = unknown, Format extends Clickhouse.StreamableDataFormat = "JSONEachRow">(options: {
+    readonly query: string
+    readonly format?: Format | undefined
+    readonly query_params?: Record<string, unknown> | undefined
+  }) => Stream.Stream<QueryStreamRow<T, Format>, SqlError>
   readonly withQueryId: {
     (queryId: string): <A, E, R>(effect: Effect.Effect<A, E, R>) => Effect.Effect<A, E, R>
     <A, E, R>(effect: Effect.Effect<A, E, R>, queryId: string): Effect.Effect<A, E, R>
@@ -157,6 +203,26 @@ export interface ClickhouseClientConfig extends Clickhouse.ClickHouseClientConfi
   readonly transformResultNames?: ((str: string) => string) | undefined
   readonly transformQueryNames?: ((str: string) => string) | undefined
 }
+
+/**
+ * Element type emitted by `ClickhouseClient.queryStream` for a given streamable
+ * format: decoded rows for streamable JSON formats, rows interleaved with
+ * progress events for `JSONEachRowWithProgress`, and raw `Uint8Array` chunks
+ * for raw formats such as `CSV`, `TabSeparated` (TSV), or `Parquet`.
+ *
+ * **Gotchas**
+ *
+ * `{exception: string}` events reported by the server in
+ * `JSONEachRowWithProgress` streams are never emitted; they fail the stream
+ * with a classified `SqlError` instead.
+ *
+ * @category utility types
+ * @since 4.0.0
+ */
+export type QueryStreamRow<T, Format extends Clickhouse.StreamableDataFormat = "JSONEachRow"> = Format extends
+  "JSONEachRowWithProgress" ? Exclude<Clickhouse.RowOrProgress<T>, { exception: string }>
+  : Format extends Clickhouse.StreamableJSONDataFormat ? T
+  : Uint8Array
 
 /**
  * Creates a scoped `ClickhouseClient`, verifies connectivity with `ping()`,
@@ -205,6 +271,14 @@ export const make = (
           )
       })
     )
+
+    const killQuery = (queryId: string) =>
+      Effect.promise(() =>
+        client.command({
+          query: "KILL QUERY WHERE query_id = {queryId:String}",
+          query_params: { queryId }
+        })
+      )
 
     class ConnectionImpl implements Connection {
       private conn: Clickhouse.ClickHouseClient
@@ -259,12 +333,7 @@ export const make = (
             }
             return Effect.suspend(() => {
               controller.abort()
-              return Effect.promise(() =>
-                this.conn.command({
-                  query: "KILL QUERY WHERE query_id = {queryId:String}",
-                  query_params: { queryId }
-                })
-              )
+              return killQuery(queryId)
             })
           })
         })
@@ -342,6 +411,113 @@ export const make = (
 
     const connection = new ConnectionImpl(client)
 
+    // Runs one streaming request inside the stream's scope: when the stream is
+    // interrupted (during the request or mid-stream), the finalizer aborts the
+    // HTTP request and issues KILL QUERY for the statement.
+    const acquireStreamResult = <A>(
+      run: (params: {
+        readonly abort_signal: AbortSignal
+        readonly query_id: string
+        readonly clickhouse_settings: NonNullable<Clickhouse.BaseQueryParams["clickhouse_settings"]>
+      }) => Promise<A>
+    ): Effect.Effect<A, SqlError, Scope.Scope> =>
+      Effect.withFiber((fiber) => {
+        const queryId = fiber.getRef(QueryId) ?? Crypto.randomUUID()
+        const settings = fiber.getRef(ClickhouseSettings)
+        const controller = new AbortController()
+        return Effect.addFinalizer((exit) => {
+          if (!Exit.hasInterrupts(exit)) return Effect.void
+          controller.abort()
+          return killQuery(queryId)
+        }).pipe(
+          Effect.flatMap(() =>
+            Effect.callback<A, SqlError>((resume) => {
+              run({
+                abort_signal: controller.signal,
+                query_id: queryId,
+                clickhouse_settings: settings
+              }).then(
+                (result) => resume(Effect.succeed(result)),
+                (cause) =>
+                  resume(
+                    Effect.fail(
+                      new SqlError({ reason: classifyError(cause, "Failed to execute statement", "execute") })
+                    )
+                  )
+              )
+            })
+          )
+        )
+      })
+
+    const streamError = (cause: unknown) =>
+      new SqlError({ reason: classifyError(cause, "Failed to execute stream", "stream") })
+
+    // Raw formats go through `exec` with an explicit FORMAT clause and stream
+    // the response body untouched: `ResultSet.stream()` splits rows on newline
+    // bytes, which corrupts binary formats such as Parquet.
+    const rawQueryStream = (options: {
+      readonly query: string
+      readonly format: Clickhouse.RawDataFormat
+      readonly query_params: Record<string, unknown> | undefined
+    }): Stream.Stream<Uint8Array, SqlError> =>
+      acquireStreamResult((params) =>
+        client.exec({
+          query: `${options.query} FORMAT ${options.format}`,
+          query_params: options.query_params ?? {},
+          ...params
+        })
+      ).pipe(
+        Effect.map((result) =>
+          NodeStream.fromReadable<Uint8Array, SqlError>({
+            evaluate: () => result.stream,
+            onError: streamError
+          })
+        ),
+        Stream.unwrap
+      )
+
+    const jsonQueryStream = <T>(options: {
+      readonly query: string
+      readonly format: Clickhouse.StreamableJSONDataFormat
+      readonly query_params: Record<string, unknown> | undefined
+    }): Stream.Stream<T, SqlError> =>
+      acquireStreamResult((params) =>
+        client.query({
+          query: options.query,
+          query_params: options.query_params ?? {},
+          format: options.format,
+          ...params
+        })
+      ).pipe(
+        Effect.map((result) =>
+          NodeStream.fromReadable<ReadonlyArray<Clickhouse.Row<T, Clickhouse.StreamableJSONDataFormat>>, SqlError>({
+            evaluate: () => result.stream() as any,
+            onError: streamError
+          })
+        ),
+        Stream.unwrap,
+        Stream.mapEffect((rows) =>
+          Effect.suspend(() => {
+            let parsed: Array<T>
+            try {
+              parsed = rows.map((row) => row.json() as T)
+            } catch (cause) {
+              return Effect.fail(new SqlError({ reason: classifyError(cause, "Failed to parse row", "parseRow") }))
+            }
+            if (options.format === "JSONEachRowWithProgress") {
+              for (const value of parsed) {
+                if (isExceptionEvent(value)) {
+                  return Effect.fail(exceptionEventError(value))
+                }
+              }
+            }
+            return Effect.succeed(parsed)
+          })
+        ),
+        Stream.flattenIterable
+      )
+
     return Object.assign(
       yield* Client.make({
         acquirer: Effect.succeed(connection),
@@ -367,6 +543,7 @@ export const make = (
           readonly table: string
           readonly values: Clickhouse.InsertValues<Readable, T>
           readonly format?: Clickhouse.DataFormat
+          readonly columns?: NonNullable<Clickhouse.InsertParams<Readable, T>["columns"]>
         }) {
           return Effect.callback<Clickhouse.InsertResult, SqlError>((resume) => {
             const fiber = Fiber.getCurrent()!
@@ -386,14 +563,20 @@ export const make = (
             )
             return Effect.suspend(() => {
               controller.abort()
-              return Effect.promise(() =>
-                client.command({
-                  query: "KILL QUERY WHERE query_id = {queryId:String}",
-                  query_params: { queryId }
-                })
-              )
+              return killQuery(queryId)
             })
           })
+        },
+        queryStream<T = unknown, Format extends Clickhouse.StreamableDataFormat = "JSONEachRow">(options: {
+          readonly query: string
+          readonly format?: Format | undefined
+          readonly query_params?: Record<string, unknown> | undefined
+        }): Stream.Stream<QueryStreamRow<T, Format>, SqlError> {
+          const format = options.format ?? "JSONEachRow"
+          const stream = isRawFormat(format)
+            ? rawQueryStream({ query: options.query, format, query_params: options.query_params })
+            : jsonQueryStream<T>({ query: options.query, format, query_params: options.query_params })
+          return stream as Stream.Stream<QueryStreamRow<T, Format>, SqlError>
         },
         withQueryId: dual(
           2,
