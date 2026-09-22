@@ -1,10 +1,10 @@
 import { ClickhouseClient } from "@effect/sql-clickhouse"
 import { assert, beforeEach, describe, it } from "@effect/vitest"
 import { Effect, Fiber, Stream } from "effect"
+import * as Reactivity from "effect/reactivity/Reactivity"
+import * as Statement from "effect/sql/Statement"
 import { TestClock } from "effect/testing"
-import * as Reactivity from "effect/unstable/reactivity/Reactivity"
 import { SqlError } from "effect/unstable/sql/SqlError"
-import * as Statement from "effect/unstable/sql/Statement"
 import { Readable } from "node:stream"
 import { vi } from "vitest"
 
