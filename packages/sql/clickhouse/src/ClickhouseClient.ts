@@ -84,8 +84,6 @@ const classifyError = (
   return fallback === "connection" ? new ConnectionError(props) : new UnknownError(props)
 }
 
-// Kept in sync with `SupportedRawFormats` from `@clickhouse/client` by the
-// `satisfies` check: adding or removing a raw format upstream fails to compile.
 const rawDataFormats = {
   CSV: true,
   CSVWithNames: true,
@@ -100,7 +98,6 @@ const rawDataFormats = {
   Parquet: true
 } satisfies Record<Clickhouse.RawDataFormat, true>
 
-// A type guard: `format in rawDataFormats` alone narrows the record, not `format`
 const isRawFormat = (format: Clickhouse.StreamableDataFormat): format is Clickhouse.RawDataFormat =>
   format in rawDataFormats
 
@@ -421,33 +418,33 @@ export const make = (
         readonly clickhouse_settings: NonNullable<Clickhouse.BaseQueryParams["clickhouse_settings"]>
       }) => Promise<A>
     ): Effect.Effect<A, SqlError, Scope.Scope> =>
-      Effect.withFiber((fiber) => {
+      Effect.gen(function*() {
+        // the fiber reads the per-request refs set by `withQueryId` and
+        // `withClickhouseSettings` on the fiber that runs the stream
+        const fiber = Fiber.getCurrent()!
         const queryId = fiber.getRef(QueryId) ?? Crypto.randomUUID()
         const settings = fiber.getRef(ClickhouseSettings)
         const controller = new AbortController()
-        return Effect.addFinalizer((exit) => {
+        yield* Effect.addFinalizer((exit) => {
           if (!Exit.hasInterrupts(exit)) return Effect.void
           controller.abort()
           return killQuery(queryId)
-        }).pipe(
-          Effect.flatMap(() =>
-            Effect.callback<A, SqlError>((resume) => {
-              run({
-                abort_signal: controller.signal,
-                query_id: queryId,
-                clickhouse_settings: settings
-              }).then(
-                (result) => resume(Effect.succeed(result)),
-                (cause) =>
-                  resume(
-                    Effect.fail(
-                      new SqlError({ reason: classifyError(cause, "Failed to execute statement", "execute") })
-                    )
-                  )
+        })
+        return yield* Effect.callback<A, SqlError>((resume) => {
+          run({
+            abort_signal: controller.signal,
+            query_id: queryId,
+            clickhouse_settings: settings
+          }).then(
+            (result) => resume(Effect.succeed(result)),
+            (cause) =>
+              resume(
+                Effect.fail(
+                  new SqlError({ reason: classifyError(cause, "Failed to execute statement", "execute") })
+                )
               )
-            })
           )
-        )
+        })
       })
 
     const streamError = (cause: unknown) =>
@@ -461,42 +458,41 @@ export const make = (
       readonly format: Clickhouse.RawDataFormat
       readonly query_params: Record<string, unknown> | undefined
     }): Stream.Stream<Uint8Array, SqlError> =>
-      acquireStreamResult((params) =>
-        client.exec({
-          query: `${options.query} FORMAT ${options.format}`,
-          query_params: options.query_params ?? {},
-          ...params
-        })
-      ).pipe(
-        Effect.map((result) =>
-          NodeStream.fromReadable<Uint8Array, SqlError>({
-            evaluate: () => result.stream,
-            onError: streamError
+      Stream.unwrap(Effect.gen(function*() {
+        const result = yield* acquireStreamResult((params) =>
+          client.exec({
+            query: `${options.query} FORMAT ${options.format}`,
+            query_params: options.query_params ?? {},
+            ...params
           })
-        ),
-        Stream.unwrap
-      )
+        )
+        return NodeStream.fromReadable<Uint8Array, SqlError>({
+          evaluate: () => result.stream,
+          onError: streamError
+        })
+      }))
 
     const jsonQueryStream = <T>(options: {
       readonly query: string
       readonly format: Clickhouse.StreamableJSONDataFormat
       readonly query_params: Record<string, unknown> | undefined
     }): Stream.Stream<T, SqlError> =>
-      acquireStreamResult((params) =>
-        client.query({
-          query: options.query,
-          query_params: options.query_params ?? {},
-          format: options.format,
-          ...params
-        })
-      ).pipe(
-        Effect.map((result) =>
-          NodeStream.fromReadable<ReadonlyArray<Clickhouse.Row<T, Clickhouse.StreamableJSONDataFormat>>, SqlError>({
+      Stream.unwrap(Effect.gen(function*() {
+        const result = yield* acquireStreamResult((params) =>
+          client.query({
+            query: options.query,
+            query_params: options.query_params ?? {},
+            format: options.format,
+            ...params
+          })
+        )
+        return NodeStream.fromReadable<ReadonlyArray<Clickhouse.Row<T, Clickhouse.StreamableJSONDataFormat>>, SqlError>(
+          {
             evaluate: () => result.stream() as any,
             onError: streamError
-          })
-        ),
-        Stream.unwrap,
+          }
+        )
+      })).pipe(
         Stream.mapEffect((rows) =>
           Effect.suspend(() => {
             let parsed: Array<T>
