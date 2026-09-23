@@ -19,7 +19,3 @@ element type of the stream:
 Streams fail with the same classified `SqlError` values as regular queries.
 Interrupting a stream — while the request is in flight or mid-stream — aborts
 the HTTP request and issues `KILL QUERY` for the statement.
-
-`ClickhouseClient.insertQuery` now also accepts the `columns` option of
-`@clickhouse/client`, allowing inserts into a subset of columns or all columns
-except the listed ones.

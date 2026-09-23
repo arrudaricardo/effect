@@ -145,22 +145,6 @@ describe("ClickhouseClient", { concurrent: false }, () => {
       Effect.provide(Reactivity.layer)
     ))
 
-  it.effect("passes column selection to insertQuery", () =>
-    Effect.gen(function*() {
-      connectImmediately = true
-      insertImpl = () => Promise.resolve({ executed: true, query_id: "" })
-      const client = yield* ClickhouseClient.make({ url: "http://localhost:8123" })
-
-      yield* client.insertQuery({ table: "people", values: [{ name: "Alice" }], columns: ["name"] })
-      yield* client.insertQuery({ table: "people", values: [{ name: "Bob" }], columns: { except: ["id"] } })
-
-      assert.strictEqual(insertCalls.length, 2)
-      assert.strictEqual(insertCalls[0].table, "people")
-      assert.strictEqual(insertCalls[0].format, "JSONEachRow")
-      assert.deepStrictEqual(insertCalls[0].columns, ["name"])
-      assert.deepStrictEqual(insertCalls[1].columns, { except: ["id"] })
-    }).pipe(Effect.provide(Reactivity.layer)))
-
   it.effect("does not leak per-request query id and settings into later requests", () =>
     Effect.gen(function*() {
       connectImmediately = true
