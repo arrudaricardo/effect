@@ -153,7 +153,6 @@ export interface ClickhouseClient extends Client.SqlClient {
     readonly table: string
     readonly values: Clickhouse.InsertValues<Readable, T>
     readonly format?: Clickhouse.DataFormat
-    readonly columns?: NonNullable<Clickhouse.InsertParams<Readable, T>["columns"]>
   }) => Effect.Effect<Clickhouse.InsertResult, SqlError>
   readonly queryStream: <T = unknown, Format extends Clickhouse.StreamableDataFormat = "JSONEachRow">(options: {
     readonly query: string
@@ -539,7 +538,6 @@ export const make = (
           readonly table: string
           readonly values: Clickhouse.InsertValues<Readable, T>
           readonly format?: Clickhouse.DataFormat
-          readonly columns?: NonNullable<Clickhouse.InsertParams<Readable, T>["columns"]>
         }) {
           return Effect.callback<Clickhouse.InsertResult, SqlError>((resume) => {
             const fiber = Fiber.getCurrent()!
